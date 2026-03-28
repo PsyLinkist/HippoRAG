@@ -1,4 +1,4 @@
-1. Fact→Passage Prior
+1. Fact→Passage Prior o
 
 做法：把 filtered triples 的分数直接回灌到这些 triples 来源的 passage 节点上，作为额外的 seed prior。
 插槽：graph_search_with_fact_entities()
@@ -12,7 +12,7 @@
 没有 triples / triples 很弱：提高 dense passage 权重
 插槽：graph_search_with_fact_entities()
 灵感来源：HippoRAG 2 本来就把 passage nodes 作为 seed，并专门讨论了 weight factor；Q-PRM 则说明 query rewriting/处理应当随 query 复杂度变化，而不是固定规则。
-3. Dense + Graph 的 RRF 融合
+3. Dense + Graph 的 RRF 融合 x
 
 做法：保留原始 PPR 排名，再和 dense passage retrieval 排名做一次 RRF / Borda / 加权和 融合。
 插槽：PPR 输出 top passages 后
@@ -57,7 +57,7 @@ dense similarity
 是否形成两跳链
 插槽：PPR 之后，QA 之前
 为什么值得试：KG²RAG 明确采用“seed chunks -> KG-guided chunk expansion -> chunk organization”；HopRAG 也是 logic-aware 的多跳推理路线。你不重建 KG，只是在已有结果上做局部扩展。
-8. Coverage-aware Rerank
+8. Coverage-aware Rerank o
 
 做法：对 top-K passages 重新打分，奖励“覆盖更多 filtered triples / 更多 query entity / 更多 hop bridge entity”的 passage。
 一个简单分数可以是：

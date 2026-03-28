@@ -414,17 +414,33 @@ class HippoRAG:
 
             self.rerank_time += rerank_end - rerank_start
 
+            # 说明：
+            # 若没有 facts，则保持原来的 dense retrieval。
+            # 若有 facts，则先走原始 graph/PPR，再做 coverage-aware rerank。
+
             if len(top_k_facts) == 0:
                 logger.info('No facts found after reranking, return DPR results')
                 sorted_doc_ids, sorted_doc_scores = self.dense_passage_retrieval(query)
             else:
-                sorted_doc_ids, sorted_doc_scores = self.graph_search_with_fact_entities(query=query,
-                                                                                         link_top_k=self.global_config.linking_top_k,
-                                                                                         query_fact_scores=query_fact_scores,
-                                                                                         top_k_facts=top_k_facts,
-                                                                                         top_k_fact_indices=top_k_fact_indices,
-                                                                                         passage_node_weight=self.global_config.passage_node_weight)
+                sorted_doc_ids, sorted_doc_scores = self.graph_search_with_fact_entities(
+                    query=query,
+                    link_top_k=self.global_config.linking_top_k,
+                    query_fact_scores=query_fact_scores,
+                    top_k_facts=top_k_facts,
+                    top_k_fact_indices=top_k_fact_indices,
+                    passage_node_weight=self.global_config.passage_node_weight
+                )
 
+                # 只在 graph 候选上再做一次 coverage-aware 重排
+                sorted_doc_ids, sorted_doc_scores = self.coverage_aware_rerank(
+                    candidate_doc_ids=sorted_doc_ids,
+                    candidate_doc_scores=sorted_doc_scores,
+                    top_k_facts=top_k_facts,
+                    rerank_window=50,
+                    alpha=0.20,
+                    beta=0.10
+                )
+    
             top_k_docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in sorted_doc_ids[:num_to_retrieve]]
 
             retrieval_results.append(QuerySolution(question=query, docs=top_k_docs, doc_scores=sorted_doc_scores[:num_to_retrieve]))
@@ -1517,6 +1533,106 @@ class HippoRAG:
             self.passage_node_idxs), f"Doc prob length {len(ppr_sorted_doc_ids)} != corpus length {len(self.passage_node_idxs)}"
 
         return ppr_sorted_doc_ids, ppr_sorted_doc_scores
+
+    # 说明：
+    # 本函数对 graph/PPR 返回的候选 passage 做 coverage-aware rerank。
+    # 只重排前 rerank_window 个候选，不影响离线图结构。
+    # 最终分数 = base_ppr + alpha * fact_coverage + beta * entity_coverage
+
+    def coverage_aware_rerank(self,
+                            candidate_doc_ids: np.ndarray,
+                            candidate_doc_scores: np.ndarray,
+                            top_k_facts: List[Tuple],
+                            rerank_window: int = 50,
+                            alpha: float = 0.20,
+                            beta: float = 0.10) -> Tuple[np.ndarray, np.ndarray]:
+
+        if len(candidate_doc_ids) == 0 or len(top_k_facts) == 0:
+            return candidate_doc_ids, candidate_doc_scores
+
+        rerank_window = min(rerank_window, len(candidate_doc_ids))
+
+        head_doc_ids = candidate_doc_ids[:rerank_window].tolist()
+        head_doc_scores = np.array(candidate_doc_scores[:rerank_window], dtype=float)
+
+        # 原始 PPR 分数归一化，作为 base
+        if np.any(head_doc_scores > 0):
+            base_scores = min_max_normalize(head_doc_scores)
+        else:
+            base_scores = head_doc_scores.copy()
+
+        # 1) 预处理 filtered facts -> source passage keys
+        fact_to_chunk_keys = {}
+        fact_entities = set()
+
+        for f in top_k_facts:
+            proc_fact = tuple(text_processing(list(f)))
+            fact_key = str(proc_fact)
+            matched_chunk_keys = set(self.proc_triples_to_docs.get(fact_key, set()))
+            fact_to_chunk_keys[fact_key] = matched_chunk_keys
+
+            # 只取 subject / object 做实体覆盖
+            if len(proc_fact) >= 3:
+                fact_entities.add(proc_fact[0].lower())
+                fact_entities.add(proc_fact[2].lower())
+
+        # 2) 对每个候选 passage 计算两个 coverage 特征
+        fact_coverage_scores = []
+        entity_coverage_scores = []
+
+        for doc_id in head_doc_ids:
+            chunk_key = self.passage_node_keys[doc_id]
+            passage_text = self.chunk_embedding_store.get_row(chunk_key)["content"].lower()
+
+            # 该 passage 覆盖了多少 filtered facts 的来源
+            fact_hit_count = 0
+            for _, matched_chunk_keys in fact_to_chunk_keys.items():
+                if chunk_key in matched_chunk_keys:
+                    fact_hit_count += 1
+
+            # passage 文本中覆盖了多少 filtered fact 的 subject/object
+            entity_hit_count = 0
+            for ent in fact_entities:
+                if ent and ent in passage_text:
+                    entity_hit_count += 1
+
+            fact_coverage_scores.append(fact_hit_count)
+            entity_coverage_scores.append(entity_hit_count)
+
+        fact_coverage_scores = np.array(fact_coverage_scores, dtype=float)
+        entity_coverage_scores = np.array(entity_coverage_scores, dtype=float)
+
+        if np.any(fact_coverage_scores > 0):
+            fact_coverage_scores = min_max_normalize(fact_coverage_scores)
+
+        if np.any(entity_coverage_scores > 0):
+            entity_coverage_scores = min_max_normalize(entity_coverage_scores)
+
+        # 3) 融合分数
+        fused_scores = base_scores + alpha * fact_coverage_scores + beta * entity_coverage_scores
+
+        reranked_order = np.argsort(fused_scores)[::-1]
+
+        reranked_head_doc_ids = np.array(head_doc_ids, dtype=int)[reranked_order]
+        reranked_head_doc_scores = fused_scores[reranked_order]
+
+        # 保留后半段原顺序不动
+        if len(candidate_doc_ids) > rerank_window:
+            tail_doc_ids = candidate_doc_ids[rerank_window:]
+            tail_doc_scores = candidate_doc_scores[rerank_window:]
+
+            final_doc_ids = np.concatenate([reranked_head_doc_ids, tail_doc_ids])
+            final_doc_scores = np.concatenate([reranked_head_doc_scores, tail_doc_scores])
+        else:
+            final_doc_ids = reranked_head_doc_ids
+            final_doc_scores = reranked_head_doc_scores
+
+        logger.info(
+            f"[DEBUG] coverage-aware rerank enabled. "
+            f"window={rerank_window}, alpha={alpha}, beta={beta}"
+        )
+
+        return final_doc_ids, final_doc_scores
 
 
     def rerank_facts(self, query: str, query_fact_scores: np.ndarray) -> Tuple[List[int], List[Tuple], dict]:
