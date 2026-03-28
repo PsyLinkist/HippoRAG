@@ -140,7 +140,29 @@ def main():
     hipporag.index(docs)
 
     # Retrieval and QA
-    hipporag.rag_qa(queries=all_queries, gold_docs=gold_docs, gold_answers=gold_answers)
+    # 说明：
+    # 本代码用于在程序跑完后，同时打印 Retrieval 的 Recall@2 / Recall@5
+    # 以及 QA 的 ExactMatch / F1，方便统一记录实验结果。
+
+    result = hipporag.rag_qa(
+        queries=all_queries,
+        gold_docs=gold_docs,
+        gold_answers=gold_answers
+    )
+
+    if gold_docs is not None:
+        queries_solutions, all_response_message, all_metadata, overall_retrieval_result, overall_qa_results = result
+
+        final_summary = {
+            "Recall@2": overall_retrieval_result.get("Recall@2", None),
+            "Recall@5": overall_retrieval_result.get("Recall@5", None),
+            "ExactMatch": overall_qa_results.get("ExactMatch", None),
+            "F1": overall_qa_results.get("F1", None),
+        }
+
+        logging.info(f"Final evaluation summary: {final_summary}")
+    else:
+        queries_solutions, all_response_message, all_metadata = result
 
 if __name__ == "__main__":
     main()
