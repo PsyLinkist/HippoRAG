@@ -1434,12 +1434,19 @@ class HippoRAG:
                 - The second array consists of the PPR scores associated with the sorted document IDs.
         """
 
-        #Assigning phrase weights based on selected facts from previous steps.
+        # 说明：
+        # 本代码在原有 phrase seed 和 dense passage seed 的基础上，
+        # 额外加入 fact -> source passage 的先验分数，
+        # 不需要重建图，只影响 online retrieval 阶段。
+
         linking_score_map = {}  # from phrase to the average scores of the facts that contain the phrase
         phrase_scores = {}  # store all fact scores for each phrase regardless of whether they exist in the knowledge graph or not
         phrase_weights = np.zeros(len(self.graph.vs['name']))
         passage_weights = np.zeros(len(self.graph.vs['name']))
+        fact_passage_weights = np.zeros(len(self.graph.vs['name']))   # 新增
         number_of_occurs = np.zeros(len(self.graph.vs['name']))
+
+        fact_passage_weight = passage_node_weight   # 最小版本先直接和原 passage weight 同量级
 
         phrases_and_ids = set()
 
@@ -1468,7 +1475,8 @@ class HippoRAG:
 
                 phrases_and_ids.add((phrase, phrase_id))
 
-        phrase_weights /= number_of_occurs
+        valid_mask = number_of_occurs > 0
+        phrase_weights[valid_mask] /= number_of_occurs[valid_mask]
 
         for phrase, phrase_id in phrases_and_ids:
             if phrase not in phrase_scores:
@@ -1497,6 +1505,51 @@ class HippoRAG:
             passage_node_text = self.chunk_embedding_store.get_row(passage_node_key)["content"]
             linking_score_map[passage_node_text] = passage_dpr_score * passage_node_weight
 
+        # 说明：
+        # 将 filtered facts 的分数分配给这些 facts 的来源 passage，
+        # 作为额外的 PPR seed prior。
+        for rank, f in enumerate(top_k_facts):
+            fact_score = query_fact_scores[top_k_fact_indices[rank]] if query_fact_scores.ndim > 0 else query_fact_scores
+            fact_score = float(fact_score)
+
+            # 和离线索引中的 triple key 保持一致
+            proc_fact = tuple(text_processing(list(f)))
+
+            matched_chunk_keys = list(self.proc_triples_to_docs.get(str(proc_fact), set()))
+            if len(matched_chunk_keys) == 0:
+                continue
+
+            # 一个 fact 若来自多个 passage，则先均分
+            per_chunk_score = fact_score / max(1, len(matched_chunk_keys))
+
+            for chunk_key in matched_chunk_keys:
+                passage_node_id = self.node_name_to_vertex_idx.get(chunk_key, None)
+                if passage_node_id is None:
+                    continue
+                fact_passage_weights[passage_node_id] += per_chunk_score
+
+        # 只对 passage 节点部分做归一化，再乘权重
+        fact_passage_scores = np.array([fact_passage_weights[idx] for idx in self.passage_node_idxs])
+
+        if np.any(fact_passage_scores > 0):
+            fact_passage_scores = min_max_normalize(fact_passage_scores)
+
+            for local_i, global_idx in enumerate(self.passage_node_idxs):
+                score = fact_passage_scores[local_i] * fact_passage_weight
+                fact_passage_weights[global_idx] = score
+
+                # 可选：把这部分也记录进 linking_score_map，便于调试观察
+                if score > 0:
+                    passage_node_key = self.passage_node_keys[local_i]
+                    passage_node_text = self.chunk_embedding_store.get_row(passage_node_key)["content"]
+                    # 若 passage 已经有 dense 分数，则累加
+                    linking_score_map[passage_node_text] = linking_score_map.get(passage_node_text, 0.0) + float(score)
+
+        # 合并到原 passage 权重
+        passage_weights += fact_passage_weights
+
+        logger.info("[DEBUG] Fact2PassagePrior enabled.")
+        
         #Combining phrase and passage scores into one array for PPR
         node_weights = phrase_weights + passage_weights
 
