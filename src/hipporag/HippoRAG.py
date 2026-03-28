@@ -437,8 +437,8 @@ class HippoRAG:
                     candidate_doc_scores=sorted_doc_scores,
                     top_k_facts=top_k_facts,
                     rerank_window=50,
-                    alpha=0.20,
-                    beta=0.10
+                    alpha=0.15,
+                    beta=0.15
                 )
     
             top_k_docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in sorted_doc_ids[:num_to_retrieve]]
