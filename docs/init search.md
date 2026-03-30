@@ -18,7 +18,7 @@
 插槽：PPR 输出 top passages 后
 为什么容易涨：HippoRAG 2 已经证明 passage 节点和图搜索是互补的；RankRAG 的核心也说明“在初始检索不完美时，context ranking 仍然很关键”。你这一步不训练，只做后融合。
 
-4. Query Decomposition 多查询检索
+4. Query Decomposition 多查询检索 x
 
 做法：先让 LLM 把问题拆成 2 个子问句或 hop 目标，然后：
 
@@ -47,7 +47,7 @@ query 中关系词与 predicate 的 lexical overlap
 包含 wh-word 对应关系模板的加分
 插槽：rerank_facts() 或 phrase seed weight 计算
 为什么合理：HippoRAG 原论文就把“允许 relation 直接引导 graph traversal”列为后续改进方向；HopRAG 的标题和路线也是 logic-aware multi-hop retrieval。你不需要改图，只是把 relation 信息更充分用于 seed 计算。
-7. HopRAG-lite：局部扩展 + 剪枝
+7. HopRAG-lite：局部扩展 + 剪枝 x
 
 做法：先拿原 HippoRAG 2 的 top-M passages，再基于它们共享的 phrase/triple 邻居做 一跳局部扩展，然后用简单规则剪枝：
 
@@ -87,7 +87,7 @@ passage B 含 e2,e3
 规则 + LLM 混合
 插槽：PPR 后，QA 前
 为什么值得试：MAIN-RAG 明确针对 noisy retrieval documents，且是 training-free。HippoRAG 2 论文也承认 graph search / filtering 还会引入错误证据。
-11. BRIEF-style Evidence Compression
+11. BRIEF-style Evidence Compression x
 
 做法：不要把 top-5 passages 原样拼给 reader；先把它们压成一个短证据块：
 
