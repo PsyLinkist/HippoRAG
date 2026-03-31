@@ -32,7 +32,6 @@ def main():
 
     global_config = BaseConfig(
         openie_mode='Transformers-offline',
-        information_extraction_model_name='Transformers/Qwen/Qwen2.5-7B-Instruct'
     )
 
     # Startup a HippoRAG instance

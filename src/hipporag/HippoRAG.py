@@ -870,8 +870,7 @@ class HippoRAG:
                                                     key_batch_size=self.global_config.synonymy_edge_key_batch_size)
 
         num_synonym_triple = 0
-        synonym_candidates = []  # [(node key, [(synonym node key, corresponding score), ...]), ...]
-
+        
         for node_key in tqdm(query_node_key2knn_node_keys.keys(), total=len(query_node_key2knn_node_keys)):
             synonyms = []
 
@@ -894,8 +893,6 @@ class HippoRAG:
 
                         self.node_to_node_stats[sim_edge] = score  # Need to seriously discuss on this
                         num_nns += 1
-
-            synonym_candidates.append((node_key, synonyms))
 
     def load_existing_openie(self, chunk_keys: List[str]) -> Tuple[List[dict], Set[str]]:
         """

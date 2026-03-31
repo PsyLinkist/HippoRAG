@@ -51,10 +51,7 @@ class BaseConfig:
         default=0,
         metadata={"help": "Temperature for sampling in each inference."}
     )
-    response_format: Union[dict, None] = field(
-        default_factory=lambda: { "type": "json_object" },
-        metadata={"help": "Specifying the format that the model must output."}
-    )
+    
     
     ## LLM specific attributes -> Async hyperparameters
     max_retry_attempts: int = field(
@@ -85,38 +82,9 @@ class BaseConfig:
         metadata={"help": "If set to True, will save the OpenIE model to disk."}
     )
     
-    # Preprocessing specific attributes
-    text_preprocessor_class_name: str = field(
-        default="TextPreprocessor",
-        metadata={"help": "Name of the text-based preprocessor to use in preprocessing."}
-    )
-    preprocess_encoder_name: str = field(
-        default="gpt-4o",
-        metadata={"help": "Name of the encoder to use in preprocessing (currently implemented specifically for doc chunking)."}
-    )
-    preprocess_chunk_overlap_token_size: int = field(
-        default=128,
-        metadata={"help": "Number of overlap tokens between neighbouring chunks."}
-    )
-    preprocess_chunk_max_token_size: int = field(
-        default=None,
-        metadata={"help": "Max number of tokens each chunk can contain. If set to None, the whole doc will treated as a single chunk."}
-    )
-    preprocess_chunk_func: Literal["by_token", "by_word"] = field(default='by_token')
-    
-    
-    # Information extraction specific attributes
-    information_extraction_model_name: Literal["openie_openai_gpt", ] = field(
-        default="openie_openai_gpt",
-        metadata={"help": "Class name indicating which information extraction model to use."}
-    )
     openie_mode: Literal["offline", "online"] = field(
         default="online",
         metadata={"help": "Mode of the OpenIE model to use."}
-    )
-    skip_graph: bool = field(
-        default=False,
-        metadata={"help": "Whether to skip graph construction or not. Set it to be true when running vllm offline indexing for the first time."}
     )
     
     
@@ -184,10 +152,6 @@ class BaseConfig:
     
     
     # QA specific attributes
-    max_qa_steps: int = field(
-        default=1,
-        metadata={"help": "For answering a single question, the max steps that we use to interleave retrieval and reasoning."}
-    )
     qa_top_k: int = field(
         default=5,
         metadata={"help": "Feeding top k documents to the QA model for reading."}
@@ -208,16 +172,6 @@ class BaseConfig:
         metadata={"help": "Dataset to use. If specified, it means we will run specific datasets. If not specified, it means we're running freely."}
     )
     ## Dataset running specific attributes -> Graph
-    graph_type: Literal[
-        'dpr_only', 
-        'entity', 
-        'passage_entity', 'relation_aware_passage_entity',
-        'passage_entity_relation', 
-        'facts_and_sim_passage_node_unidirectional',
-    ] = field(
-        default="facts_and_sim_passage_node_unidirectional",
-        metadata={"help": "Type of graph to use in the experiment."}
-    )
     corpus_len: Optional[int] = field(
         default=None,
         metadata={"help": "Length of the corpus to use."}
