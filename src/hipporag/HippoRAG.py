@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Union, Optional, List, Set, Dict, Any, Tuple, Literal
+import igraph
 import numpy as np
 import importlib
 from collections import defaultdict
@@ -439,6 +440,23 @@ class HippoRAG:
                     rerank_window=50,
                     alpha=0.15,
                     beta=0.15
+                )
+                
+                # 说明：
+                # 在 coverage-aware rerank 后，再对 top30 做一次局部子图 restricted PPR 重排。
+                sorted_doc_ids, sorted_doc_scores = self.local_subgraph_ppr_rerank(
+                    query=query,
+                    candidate_doc_ids=sorted_doc_ids,
+                    candidate_doc_scores=sorted_doc_scores,
+                    top_k_facts=top_k_facts,
+                    top_k_fact_indices=top_k_fact_indices,
+                    query_fact_scores=query_fact_scores,
+                    rerank_window=30,
+                    seed_doc_top_m=10,
+                    expansion_hops=2,
+                    max_local_nodes=2500,
+                    passage_seed_weight=self.global_config.passage_node_weight,
+                    local_ppr_weight=0.35
                 )
     
             top_k_docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in sorted_doc_ids[:num_to_retrieve]]
@@ -1634,6 +1652,213 @@ class HippoRAG:
 
         return final_doc_ids, final_doc_scores
 
+    # 说明：
+    # 对 coverage-aware rerank 之后的 top30，再做一次“局部子图上的 restricted PPR”重排。
+    # 核心思想：
+    # - 用 top10 passages 作为局部子图锚点
+    # - 只在锚点周围的小子图上重新跑 PPR
+    # - 重新构造 phrase seeds + passage seeds
+    # - 最终用：base_score + local_ppr_score 做融合
+    def local_subgraph_ppr_rerank(self,
+                                query: str,
+                                candidate_doc_ids: np.ndarray,
+                                candidate_doc_scores: np.ndarray,
+                                top_k_facts: List[Tuple],
+                                top_k_fact_indices: List[int],
+                                query_fact_scores: np.ndarray,
+                                rerank_window: int = 30,
+                                seed_doc_top_m: int = 10,
+                                expansion_hops: int = 3,
+                                max_local_nodes: int = 2500,
+                                passage_seed_weight: float = 0.05,
+                                local_ppr_weight: float = 0.35) -> Tuple[np.ndarray, np.ndarray]:
+
+        if len(candidate_doc_ids) == 0 or len(top_k_facts) == 0:
+            return candidate_doc_ids, candidate_doc_scores
+
+        rerank_window = min(rerank_window, len(candidate_doc_ids))
+        seed_doc_top_m = min(seed_doc_top_m, rerank_window)
+
+        head_doc_ids = candidate_doc_ids[:rerank_window].tolist()
+        head_doc_scores = np.array(candidate_doc_scores[:rerank_window], dtype=float)
+
+        # 原始 coverage-aware 分数，作为 base
+        if np.any(head_doc_scores > 0):
+            base_scores = min_max_normalize(head_doc_scores)
+        else:
+            base_scores = head_doc_scores.copy()
+
+        # ---------- 1) 构建局部子图 ----------
+        seed_doc_ids = head_doc_ids[:seed_doc_top_m]
+
+        local_subgraph, local_vertices, global_to_local = self._build_local_subgraph(
+            seed_doc_ids=seed_doc_ids,
+            expansion_hops=expansion_hops,
+            max_local_nodes=max_local_nodes
+        )
+
+        if local_subgraph is None or local_subgraph.vcount() == 0:
+            return candidate_doc_ids, candidate_doc_scores
+
+        # ---------- 2) 在局部子图上重新构造 reset probabilities ----------
+        local_phrase_weights = np.zeros(local_subgraph.vcount())
+        local_passage_weights = np.zeros(local_subgraph.vcount())
+        phrase_occurs = np.zeros(local_subgraph.vcount())
+
+        # 2.1 phrase seeds：仍然来自 top_k_facts
+        for rank, f in enumerate(top_k_facts):
+            fact_score = query_fact_scores[top_k_fact_indices[rank]] if query_fact_scores.ndim > 0 else query_fact_scores
+            fact_score = float(fact_score)
+
+            subject_phrase = f[0].lower()
+            object_phrase = f[2].lower()
+
+            for phrase in [subject_phrase, object_phrase]:
+                phrase_key = compute_mdhash_id(content=phrase, prefix="entity-")
+                global_vid = self.node_name_to_vertex_idx.get(phrase_key, None)
+
+                if global_vid is None or global_vid not in global_to_local:
+                    continue
+
+                local_vid = global_to_local[global_vid]
+
+                weighted_fact_score = fact_score
+                if len(self.ent_node_to_chunk_ids.get(phrase_key, set())) > 0:
+                    weighted_fact_score /= len(self.ent_node_to_chunk_ids[phrase_key])
+
+                local_phrase_weights[local_vid] += weighted_fact_score
+                phrase_occurs[local_vid] += 1
+
+        valid_mask = phrase_occurs > 0
+        local_phrase_weights[valid_mask] /= phrase_occurs[valid_mask]
+
+        # 2.2 passage seeds：来自当前 top30 的已有排序结果
+        norm_head_scores = min_max_normalize(head_doc_scores) if np.any(head_doc_scores > 0) else head_doc_scores.copy()
+
+        for rank, doc_id in enumerate(head_doc_ids):
+            chunk_key = self.passage_node_keys[doc_id]
+            global_vid = self.node_name_to_vertex_idx.get(chunk_key, None)
+
+            if global_vid is None or global_vid not in global_to_local:
+                continue
+
+            local_vid = global_to_local[global_vid]
+            local_passage_weights[local_vid] = norm_head_scores[rank] * passage_seed_weight
+
+        local_reset = local_phrase_weights + local_passage_weights
+
+        if np.sum(local_reset) <= 0:
+            return candidate_doc_ids, candidate_doc_scores
+
+        # ---------- 3) 在局部子图上重新跑一次 restricted PPR ----------
+        local_reset = np.where(np.isnan(local_reset) | (local_reset < 0), 0, local_reset)
+
+        local_pagerank_scores = local_subgraph.personalized_pagerank(
+            vertices=range(local_subgraph.vcount()),
+            damping=self.global_config.damping if self.global_config.damping is not None else 0.5,
+            directed=False,
+            weights='weight',
+            reset=local_reset,
+            implementation='prpack'
+        )
+
+        # 只取原 top30 passage 的局部 PPR 分数
+        local_doc_scores = []
+        for doc_id in head_doc_ids:
+            chunk_key = self.passage_node_keys[doc_id]
+            global_vid = self.node_name_to_vertex_idx.get(chunk_key, None)
+
+            if global_vid is None or global_vid not in global_to_local:
+                local_doc_scores.append(0.0)
+                continue
+
+            local_vid = global_to_local[global_vid]
+            local_doc_scores.append(local_pagerank_scores[local_vid])
+
+        local_doc_scores = np.array(local_doc_scores, dtype=float)
+
+        if np.any(local_doc_scores > 0):
+            local_doc_scores = min_max_normalize(local_doc_scores)
+
+        # ---------- 4) 融合 base + local_subgraph_ppr ----------
+        fused_scores = base_scores + local_ppr_weight * local_doc_scores
+
+        reranked_order = np.argsort(fused_scores)[::-1]
+
+        reranked_head_doc_ids = np.array(head_doc_ids, dtype=int)[reranked_order]
+        reranked_head_doc_scores = fused_scores[reranked_order]
+
+        # 后半段保持原顺序不动
+        if len(candidate_doc_ids) > rerank_window:
+            tail_doc_ids = candidate_doc_ids[rerank_window:]
+            tail_doc_scores = candidate_doc_scores[rerank_window:]
+
+            final_doc_ids = np.concatenate([reranked_head_doc_ids, tail_doc_ids])
+            final_doc_scores = np.concatenate([reranked_head_doc_scores, tail_doc_scores])
+        else:
+            final_doc_ids = reranked_head_doc_ids
+            final_doc_scores = reranked_head_doc_scores
+
+        logger.info(
+            f"[DEBUG] local-subgraph PPR rerank enabled. "
+            f"window={rerank_window}, seed_doc_top_m={seed_doc_top_m}, "
+            f"expansion_hops={expansion_hops}, max_local_nodes={max_local_nodes}, "
+            f"local_ppr_weight={local_ppr_weight}"
+        )
+
+        return final_doc_ids, final_doc_scores
+
+    # 说明：
+    # 基于 top passages 的一小部分 seed docs，在全局图中做局部邻域展开，
+    # 构造一个用于 restricted PPR 的局部子图。
+    def _build_local_subgraph(self,
+                            seed_doc_ids: List[int],
+                            expansion_hops: int = 3,
+                            max_local_nodes: int = 2500) -> Tuple[igraph.Graph, List[int], Dict[int, int]]:
+
+        # 从全局 passage doc_id 转成全局图 vertex idx
+        seed_vertex_idxs = []
+        for doc_id in seed_doc_ids:
+            chunk_key = self.passage_node_keys[doc_id]
+            g_vid = self.node_name_to_vertex_idx.get(chunk_key, None)
+            if g_vid is not None:
+                seed_vertex_idxs.append(g_vid)
+
+        if len(seed_vertex_idxs) == 0:
+            return None, [], {}
+
+        local_node_set = set(seed_vertex_idxs)
+        frontier = set(seed_vertex_idxs)
+
+        # BFS 式局部展开
+        for _ in range(expansion_hops):
+            if len(local_node_set) >= max_local_nodes:
+                break
+
+            next_frontier = set()
+
+            for vid in frontier:
+                nbrs = self.graph.neighbors(vid, mode="all")
+                for nb in nbrs:
+                    if nb not in local_node_set:
+                        local_node_set.add(nb)
+                        next_frontier.add(nb)
+
+                        if len(local_node_set) >= max_local_nodes:
+                            break
+
+                if len(local_node_set) >= max_local_nodes:
+                    break
+
+            frontier = next_frontier
+            if len(frontier) == 0:
+                break
+
+        local_vertices = sorted(local_node_set)
+        local_subgraph = self.graph.induced_subgraph(local_vertices)
+        global_to_local = {g_vid: l_vid for l_vid, g_vid in enumerate(local_vertices)}
+
+        return local_subgraph, local_vertices, global_to_local
 
     def rerank_facts(self, query: str, query_fact_scores: np.ndarray) -> Tuple[List[int], List[Tuple], dict]:
         """
