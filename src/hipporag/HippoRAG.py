@@ -33,6 +33,7 @@ from .utils.misc_utils import NerRawOutput, TripleRawOutput
 from .utils.embed_utils import retrieve_knn
 from .utils.typing import Triple
 from .utils.config_utils import BaseConfig
+from .utils.llm_utils import fix_broken_generated_json
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,16 @@ class HippoRAG:
         self.all_retrieval_time = 0
 
         self.ent_node_to_chunk_ids = None
+        self.query_to_variants: Dict[str, List[str]] = {}
+        self.query_to_sub_query_schemas: Dict[str, List[Dict[str, Any]]] = {}
+        self.query_to_is_multi_hop: Dict[str, bool] = {}
+        self.run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+        self.run_logs_dir = os.path.join(self.global_config.save_dir, "run_logs")
+        os.makedirs(self.run_logs_dir, exist_ok=True)
+        self.query_understanding_log_path = os.path.join(
+            self.run_logs_dir,
+            f"query_understanding_{self.run_id}.jsonl"
+        )
 
 
     def initialize_graph(self):
@@ -1287,6 +1298,173 @@ class HippoRAG:
             for query, embedding in zip(all_query_strings, query_embeddings_for_passage):
                 self.query_to_embedding['passage'][query] = embedding
 
+    def get_query_variants(self, query: str) -> List[str]:
+        """
+        Generate retrieval-oriented query variants for fact scoring.
+
+        The current experimental implementation first classifies whether a query
+        requires multi-hop reasoning. Single-hop queries keep only the original query.
+        Multi-hop queries are decomposed into up to three single-hop sub-queries, each
+        paired with a triple schema that contains at most one unknown slot. The sub-query
+        text is used for retrieval, while the triple schema is retained in the cache for
+        inspection and future extensions.
+        """
+        if query in self.query_to_variants:
+            return self.query_to_variants[query]
+
+        variants = [query]
+        self.query_to_sub_query_schemas[query] = []
+        self.query_to_is_multi_hop[query] = False
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are helping a fact-retrieval system decide whether a question is single-hop or multi-hop. "
+                    "Return JSON only with keys: is_multi_hop (boolean), sub_queries (array). "
+                    "If the question is single-hop, return is_multi_hop=false and an empty sub_queries array. "
+                    "If the question is multi-hop, decompose it into up to 3 atomic single-hop sub-queries. "
+                    "Each item in sub_queries must be an object with keys: question (string), "
+                    "triple_schema (array of 3 strings). Each triple_schema must represent a single relation query "
+                    "with at most one unknown slot written as '?'. Do not invent missing facts. "
+                    "Use placeholders such as 'director of The Ancestor' when the bridge entity is not known yet."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Question:\n"
+                    f"{query}\n\n"
+                    "Return a compact JSON object. Keep each sub-query short and retrieval-oriented."
+                ),
+            },
+        ]
+
+        try:
+            response = self.llm_model.infer(messages=messages, model=self.global_config.llm_name, max_completion_tokens=512)
+            raw_text = response[0] if isinstance(response, tuple) else response
+            if not isinstance(raw_text, str):
+                raw_text = str(raw_text)
+
+            parsed = json.loads(fix_broken_generated_json(raw_text))
+
+            is_multi_hop = bool(parsed.get("is_multi_hop", False))
+            self.query_to_is_multi_hop[query] = is_multi_hop
+            sub_queries = parsed.get("sub_queries", [])
+
+            if is_multi_hop and isinstance(sub_queries, list):
+                for sub_query in sub_queries[:3]:
+                    if not isinstance(sub_query, dict):
+                        continue
+
+                    question_text = sub_query.get("question", "")
+                    triple_schema = sub_query.get("triple_schema", [])
+
+                    triple_schema_is_valid = (
+                        isinstance(triple_schema, list)
+                        and len(triple_schema) == 3
+                        and all(isinstance(slot, str) and slot.strip() for slot in triple_schema)
+                        and sum(1 for slot in triple_schema if slot.strip() == "?") <= 1
+                    )
+
+                    if not triple_schema_is_valid:
+                        continue
+
+                    if isinstance(question_text, str) and question_text.strip():
+                        normalized_question = question_text.strip()
+                        variants.append(normalized_question)
+                        self.query_to_sub_query_schemas[query].append(
+                            {
+                                "question": normalized_question,
+                                "triple_schema": [slot.strip() for slot in triple_schema],
+                            }
+                        )
+        except Exception as e:
+            logger.warning(f"Falling back to original query for fact scoring because query variant generation failed: {e}")
+
+        deduped_variants = []
+        seen = set()
+        for variant in variants:
+            normalized_variant = variant.strip()
+            if not normalized_variant:
+                continue
+            if normalized_variant in seen:
+                continue
+            seen.add(normalized_variant)
+            deduped_variants.append(normalized_variant)
+
+        self.query_to_variants[query] = deduped_variants
+        return deduped_variants
+
+    def get_query_variants_with_schemas(self, query: str) -> List[str]:
+        """
+        Return retrieval variants consisting of the original query, decomposed sub-query text,
+        and triple-schema-derived retrieval strings. All returned strings are intended to
+        participate in fact-score fusion.
+        """
+        text_variants = self.get_query_variants(query)
+        schema_entries = self.query_to_sub_query_schemas.get(query, [])
+
+        variants = list(text_variants)
+        for schema_entry in schema_entries:
+            triple_schema = schema_entry.get("triple_schema", [])
+            if not isinstance(triple_schema, list) or len(triple_schema) != 3:
+                continue
+
+            schema_variant = " ".join(slot.strip() for slot in triple_schema if isinstance(slot, str) and slot.strip())
+            if schema_variant:
+                variants.append(schema_variant)
+
+        deduped_variants = []
+        seen = set()
+        for variant in variants:
+            normalized_variant = variant.strip()
+            if not normalized_variant or normalized_variant in seen:
+                continue
+            seen.add(normalized_variant)
+            deduped_variants.append(normalized_variant)
+
+        return deduped_variants
+
+    def _get_top_fact_score_summary(self, fact_scores: np.ndarray, top_k: int = 10) -> List[Dict[str, Any]]:
+        """
+        Summarize the highest-scoring facts for logging and inspection.
+        """
+        if len(fact_scores) == 0 or len(self.fact_node_keys) == 0:
+            return []
+
+        top_k = min(top_k, len(fact_scores))
+        top_indices = np.argsort(fact_scores)[-top_k:][::-1].tolist()
+        top_fact_ids = [self.fact_node_keys[idx] for idx in top_indices]
+
+        summary = []
+        try:
+            fact_rows = self.fact_embedding_store.get_rows(top_fact_ids)
+        except Exception:
+            fact_rows = {}
+
+        for idx, fact_id in zip(top_indices, top_fact_ids):
+            fact_content = fact_rows.get(fact_id, {}).get("content", "")
+            summary.append(
+                {
+                    "fact_index": idx,
+                    "fact_id": fact_id,
+                    "score": float(fact_scores[idx]),
+                    "fact": fact_content,
+                }
+            )
+
+        return summary
+
+    def _append_query_understanding_log(self, log_record: Dict[str, Any]) -> None:
+        """
+        Append a structured query-understanding record to the per-run jsonl log file.
+        """
+        try:
+            with open(self.query_understanding_log_path, "a", encoding="utf-8") as log_file:
+                log_file.write(json.dumps(log_record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning(f"Failed to save query understanding log for query '{log_record.get('query', '')}': {e}")
+
     def get_fact_scores(self, query: str) -> np.ndarray:
         """
         Retrieves and computes normalized similarity scores between the given query and pre-stored fact embeddings.
@@ -1307,22 +1485,75 @@ class HippoRAG:
             If no embedding is found for the provided query in the stored query
             embeddings dictionary.
         """
-        query_embedding = self.query_to_embedding['triple'].get(query, None)
-        if query_embedding is None:
-            query_embedding = self.embedding_model.batch_encode(query,
-                                                                instruction=get_query_instruction('query_to_fact'),
-                                                                norm=True)
-
         # Check if there are any facts
         if len(self.fact_embeddings) == 0:
             logger.warning("No facts available for scoring. Returning empty array.")
             return np.array([])
-            
+
         try:
-            query_fact_scores = np.dot(self.fact_embeddings, query_embedding.T) # shape: (#facts, )
-            query_fact_scores = np.squeeze(query_fact_scores) if query_fact_scores.ndim == 2 else query_fact_scores
-            query_fact_scores = min_max_normalize(query_fact_scores)
-            return query_fact_scores
+            query_variants = self.get_query_variants_with_schemas(query)
+            self.get_query_embeddings(query_variants)
+
+            all_variant_scores = []
+            variant_score_logs = []
+            for variant in query_variants:
+                query_embedding = self.query_to_embedding['triple'].get(variant, None)
+                if query_embedding is None:
+                    query_embedding = self.embedding_model.batch_encode(
+                        variant,
+                        instruction=get_query_instruction('query_to_fact'),
+                        norm=True
+                    )
+                    self.query_to_embedding['triple'][variant] = query_embedding
+
+                query_fact_scores = np.dot(self.fact_embeddings, query_embedding.T)  # shape: (#facts, )
+                query_fact_scores = np.squeeze(query_fact_scores) if query_fact_scores.ndim == 2 else query_fact_scores
+                query_fact_scores = min_max_normalize(query_fact_scores)
+                all_variant_scores.append(query_fact_scores)
+                variant_score_logs.append(
+                    {
+                        "variant": variant,
+                        "top_facts": self._get_top_fact_score_summary(query_fact_scores, top_k=10),
+                    }
+                )
+
+            log_record = {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "query": query,
+                "is_multi_hop": self.query_to_is_multi_hop.get(query, False),
+                "query_variants": self.query_to_variants.get(query, [query]),
+                "sub_query_schemas": self.query_to_sub_query_schemas.get(query, []),
+                "fusion_variants": query_variants,
+                "variant_score_logs": variant_score_logs,
+            }
+
+            if len(all_variant_scores) == 1:
+                log_record["fusion_method"] = "single_variant"
+                log_record["fused_top_facts"] = self._get_top_fact_score_summary(all_variant_scores[0], top_k=10)
+                self._append_query_understanding_log(log_record)
+                logger.info(
+                    f"Query understanding for query='{query[:120]}': "
+                    f"is_multi_hop={log_record['is_multi_hop']}, "
+                    f"sub_queries={len(log_record['sub_query_schemas'])}, "
+                    f"fusion_variants={len(query_variants)}"
+                )
+                return all_variant_scores[0]
+
+            fused_fact_scores = np.max(np.stack(all_variant_scores, axis=0), axis=0)
+            fused_fact_scores = min_max_normalize(fused_fact_scores)
+
+            log_record["fusion_method"] = "max"
+            log_record["fused_top_facts"] = self._get_top_fact_score_summary(fused_fact_scores, top_k=10)
+            self._append_query_understanding_log(log_record)
+
+            logger.info(
+                f"Query understanding for query='{query[:120]}': "
+                f"is_multi_hop={log_record['is_multi_hop']}, "
+                f"sub_queries={len(log_record['sub_query_schemas'])}, "
+                f"fusion_variants={len(query_variants)}"
+            )
+
+            return fused_fact_scores
         except Exception as e:
             logger.error(f"Error computing fact scores: {str(e)}")
             return np.array([])
