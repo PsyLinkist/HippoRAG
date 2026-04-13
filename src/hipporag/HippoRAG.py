@@ -164,6 +164,9 @@ class HippoRAG:
 
         self.ent_node_to_chunk_ids = None
         self.query_to_variants: Dict[str, List[str]] = {}
+        self.query_to_named_entities: Dict[str, List[str]] = {}
+        self.query_to_variables: Dict[str, List[str]] = {}
+        self.query_to_triple_schemas: Dict[str, List[List[str]]] = {}
         self.query_to_sub_query_schemas: Dict[str, List[Dict[str, Any]]] = {}
         self.query_to_is_multi_hop: Dict[str, bool] = {}
         self.run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
@@ -1302,31 +1305,38 @@ class HippoRAG:
         """
         Generate retrieval-oriented query variants for fact scoring.
 
-        The current experimental implementation first classifies whether a query
-        requires multi-hop reasoning. Single-hop queries keep only the original query.
-        Multi-hop queries are decomposed into up to three single-hop sub-queries, each
-        paired with a triple schema that contains at most one unknown slot. The sub-query
-        text is used for retrieval, while the triple schema is retained in the cache for
-        inspection and future extensions.
+        This experimental implementation performs a query-side IE step first:
+        it extracts named entities and triple schemas from the question, then
+        constrains any multi-hop sub-queries to align with those schemas.
         """
         if query in self.query_to_variants:
             return self.query_to_variants[query]
 
         variants = [query]
+        self.query_to_named_entities[query] = []
+        self.query_to_variables[query] = []
+        self.query_to_triple_schemas[query] = []
         self.query_to_sub_query_schemas[query] = []
         self.query_to_is_multi_hop[query] = False
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are helping a fact-retrieval system decide whether a question is single-hop or multi-hop. "
-                    "Return JSON only with keys: is_multi_hop (boolean), sub_queries (array). "
-                    "If the question is single-hop, return is_multi_hop=false and an empty sub_queries array. "
-                    "If the question is multi-hop, decompose it into up to 3 atomic single-hop sub-queries. "
-                    "Each item in sub_queries must be an object with keys: question (string), "
-                    "triple_schema (array of 3 strings). Each triple_schema must represent a single relation query "
-                    "with at most one unknown slot written as '?'. Do not invent missing facts. "
-                    "Use placeholders such as 'director of The Ancestor' when the bridge entity is not known yet."
+                    "You are performing query-side information extraction for a fact-retrieval system. "
+                    "Return JSON only with keys: is_multi_hop (boolean), named_entities (array of strings), "
+                    "variables (array of strings), triple_schemas (array of 3-string arrays), sub_queries (array). "
+                    "First extract the named entities explicitly mentioned in the question. "
+                    "Then define up to 4 typed variables such as [DESIGNER], [CITY], [WATER_BODY], [RIVER], [PERSON], [COUNTRY]. "
+                    "Then extract up to 4 triple_schemas that represent the question's required reasoning steps. "
+                    "Each triple schema must be a 3-string array and may contain typed variables like [DESIGNER], but must not contain a bare '?'. "
+                    "Do not invent missing facts, and do not create free-form placeholders like 'death city of designer of Southeast Library'. "
+                    "The schemas should stay close to fact-like surface forms, for example ['Southeast Library', 'designed by', '[DESIGNER]'] "
+                    "or ['[DESIGNER]', 'died in', '[CITY]']. "
+                    "If the question is single-hop, return is_multi_hop=false, include at most 1 triple_schema, and return an empty sub_queries array. "
+                    "If the question is multi-hop, return is_multi_hop=true and decompose it into up to 4 atomic single-hop sub_queries. "
+                    "Each item in sub_queries must be an object with keys: question (string), triple_schema (array of 3 strings). "
+                    "Every sub_query must be faithfully constrained by one of the returned triple_schemas, and may refer to typed variables only through natural language descriptions like "
+                    "'the designer of Southeast Library' or 'that city', not raw variable tokens."
                 ),
             },
             {
@@ -1334,7 +1344,7 @@ class HippoRAG:
                 "content": (
                     "Question:\n"
                     f"{query}\n\n"
-                    "Return a compact JSON object. Keep each sub-query short and retrieval-oriented."
+                    "Return a compact JSON object. Keep each sub-query short, retrieval-oriented, and grounded in the triple schemas."
                 ),
             },
         ]
@@ -1349,10 +1359,45 @@ class HippoRAG:
 
             is_multi_hop = bool(parsed.get("is_multi_hop", False))
             self.query_to_is_multi_hop[query] = is_multi_hop
+            named_entities = parsed.get("named_entities", [])
+            variables = parsed.get("variables", [])
+            triple_schemas = parsed.get("triple_schemas", [])
             sub_queries = parsed.get("sub_queries", [])
 
+            if isinstance(named_entities, list):
+                self.query_to_named_entities[query] = [
+                    entity.strip() for entity in named_entities
+                    if isinstance(entity, str) and entity.strip()
+                ]
+
+            if isinstance(variables, list):
+                self.query_to_variables[query] = [
+                    variable.strip() for variable in variables
+                    if isinstance(variable, str)
+                    and variable.strip()
+                    and variable.strip().startswith("[")
+                    and variable.strip().endswith("]")
+                ][:4]
+
+            if isinstance(triple_schemas, list):
+                for triple_schema in triple_schemas[:4]:
+                    triple_schema_is_valid = (
+                        isinstance(triple_schema, list)
+                        and len(triple_schema) == 3
+                        and all(isinstance(slot, str) and slot.strip() for slot in triple_schema)
+                        and "?" not in " ".join(triple_schema)
+                    )
+                    if triple_schema_is_valid:
+                        normalized_schema = [slot.strip() for slot in triple_schema]
+                        has_only_known_variables = all(
+                            token in self.query_to_variables[query]
+                            for token in re.findall(r"\[[A-Z_]+\]", " ".join(normalized_schema))
+                        )
+                        if has_only_known_variables:
+                            self.query_to_triple_schemas[query].append(normalized_schema)
+
             if is_multi_hop and isinstance(sub_queries, list):
-                for sub_query in sub_queries[:3]:
+                for sub_query in sub_queries[:4]:
                     if not isinstance(sub_query, dict):
                         continue
 
@@ -1363,13 +1408,20 @@ class HippoRAG:
                         isinstance(triple_schema, list)
                         and len(triple_schema) == 3
                         and all(isinstance(slot, str) and slot.strip() for slot in triple_schema)
-                        and sum(1 for slot in triple_schema if slot.strip() == "?") <= 1
+                        and "?" not in " ".join(triple_schema)
                     )
 
                     if not triple_schema_is_valid:
                         continue
 
-                    if isinstance(question_text, str) and question_text.strip():
+                    constrained_by_extracted_schema = [slot.strip() for slot in triple_schema] in self.query_to_triple_schemas[query]
+
+                    if (
+                        isinstance(question_text, str)
+                        and question_text.strip()
+                        and not re.search(r"\[[A-Z_]+\]", question_text.strip())
+                        and constrained_by_extracted_schema
+                    ):
                         normalized_question = question_text.strip()
                         variants.append(normalized_question)
                         self.query_to_sub_query_schemas[query].append(
@@ -1403,8 +1455,19 @@ class HippoRAG:
         """
         text_variants = self.get_query_variants(query)
         schema_entries = self.query_to_sub_query_schemas.get(query, [])
+        triple_schemas = self.query_to_triple_schemas.get(query, [])
 
         variants = list(text_variants)
+        for triple_schema in triple_schemas:
+            if not isinstance(triple_schema, list) or len(triple_schema) != 3:
+                continue
+
+            schema_variant = " ".join(
+                slot.strip() for slot in triple_schema if isinstance(slot, str) and slot.strip()
+            )
+            if schema_variant:
+                variants.append(schema_variant)
+
         for schema_entry in schema_entries:
             triple_schema = schema_entry.get("triple_schema", [])
             if not isinstance(triple_schema, list) or len(triple_schema) != 3:
@@ -1521,6 +1584,9 @@ class HippoRAG:
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "query": query,
                 "is_multi_hop": self.query_to_is_multi_hop.get(query, False),
+                "named_entities": self.query_to_named_entities.get(query, []),
+                "variables": self.query_to_variables.get(query, []),
+                "triple_schemas": self.query_to_triple_schemas.get(query, []),
                 "query_variants": self.query_to_variants.get(query, [query]),
                 "sub_query_schemas": self.query_to_sub_query_schemas.get(query, []),
                 "fusion_variants": query_variants,
